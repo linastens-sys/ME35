@@ -1,0 +1,47 @@
+import neopixel #importing the library
+from machine import Pin # another way of importing a library
+lights = neopixel.NeoPixel(Pin(15),2) # 0 is the Pin for neopixel and 4 is the number of lights
+#[0] = (0,20,20)
+#lights[1] = (0,20,20)# set the color of 0th light to purple 
+lights.write()
+
+import time
+
+def demo(np):
+    n = np.n
+
+    # cycle
+    for i in range(4 * n):
+        for j in range(n):
+            np[j] = (0, 0, 0)
+        np[i % n] = (255, 255, 255)
+        np.write()
+        time.sleep_ms(25)
+
+    # bounce
+    for i in range(4 * n):
+        for j in range(n):
+            np[j] = (0, 0, 128)
+        if (i // n) % 2 == 0:
+            np[i % n] = (0, 0, 0)
+        else:
+            np[n - 1 - (i % n)] = (0, 0, 0)
+        np.write()
+        time.sleep_ms(60)
+
+    # fade in/out
+    for i in range(0, 4 * 256, 8):
+        for j in range(n):
+            if (i // 256) % 2 == 0:
+                val = i & 0xff
+            else:
+                val = 255 - (i & 0xff)
+            np[j] = (val, 0, 0)
+        np.write()
+
+    # clear
+    for i in range(n):
+        np[i] = (0, 0, 0)
+    np.write()
+    
+#demo(lights)
