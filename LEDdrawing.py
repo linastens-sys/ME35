@@ -3,66 +3,104 @@ import math
 from machine import Pin, PWM
 from LEDpath import points
 
-l1 = 5.5
-l2 = 5.5
-max_duty = 65535
+# --- Arm geometry ---
+L1 = 5.5          # upper arm length
+L2 = 5.5          # forearm length
+
+# --- Servo settings ---
+MAX_DUTY = 65535
+PERIOD_MS = 20    # 50 Hz -> 20 ms period
+MIN_PULSE = 0.5   # ms at 0 degrees
+MAX_PULSE = 2.5   # ms at 180 degrees
+OFFSET1 = 0       # degrees, adjust so arm 1 stays within 0-180
+OFFSET2 = 0       # degrees, adjust so arm 2 stays within 0-180
+
+STEP_DELAY = 0.05  # seconds between points
+PAUSE = 0.5        # seconds between shapes
+SETTLE = 1.0       # seconds to let the arm reach the start point before drawing
+
+# --- Path scaling ---
+SCALE = 5 / 12
+X_SHIFT = 12
+
+# --- Hardware ---
+led_Y = Pin(18, Pin.OUT)
+led_G = Pin(19, Pin.OUT)
 
 pwm1 = PWM(Pin(4), freq=50)
 pwm2 = PWM(Pin(5), freq=50)
 
-scale = 5 / 12
-scaled_points = [
-    ((x - 12) * scale, y * scale)
-    for x, y in points
-]
+scaled_points = [((x - X_SHIFT) * SCALE, y * SCALE) for x, y in points]
 
-offset1 = 0
-offset2 = 0
 
-i = 0
+def angle_to_duty(angle):
+    """Convert a servo angle in degrees to a 16-bit duty value."""
+    if angle < 0 or angle > 180:
+        print("Warning: angle out of range, clamping:", angle)
+    pulse = MIN_PULSE + angle / 180 * (MAX_PULSE - MIN_PULSE)
+    pulse = max(MIN_PULSE, min(MAX_PULSE, pulse))
+    return int(pulse * MAX_DUTY / PERIOD_MS)
 
-while i < len(scaled_points):
-    x, y = scaled_points[i]
 
-    r = math.sqrt(x**2 + y**2)
+def inverse_kinematics(x, y):
+    """Return (theta1, theta2) in degrees, or None if the point is unreachable."""
+    r = math.sqrt(x * x + y * y)
+    if not (abs(L1 - L2) <= r <= L1 + L2):
+        return None
 
-    if abs(l1 - l2) <= r <= l1 + l2:
-        cos_theta2 = (
-            x**2 + y**2 - l1**2 - l2**2
-        ) / (2 * l1 * l2)
+    cos_t2 = (x * x + y * y - L1 * L1 - L2 * L2) / (2 * L1 * L2)
+    cos_t2 = max(-1.0, min(1.0, cos_t2))
+    t2 = math.acos(cos_t2)  # use -math.acos(...) if your drawing comes out mirrored
 
-        cos_theta2 = max(-1, min(1, cos_theta2))
+    t1 = math.atan2(y, x) - math.atan2(L2 * math.sin(t2), L1 + L2 * math.cos(t2))
 
-        theta2 = math.acos(cos_theta2)
+    return math.degrees(t1), math.degrees(t2)
 
-        theta1 = math.atan2(y, x) - math.atan2(
-            l2 * math.sin(theta2),
-            l1 + l2 * math.cos(theta2)
-        )
 
-        theta1 = math.degrees(theta1)
-        theta2 = math.degrees(theta2)
+def go_to_start():
+    """Move to the first reachable point with the LEDs off and let the arm settle."""
+    led_Y.off()
+    led_G.off()
+    for x, y in scaled_points:
+        angles = inverse_kinematics(x, y)
+        if angles is not None:
+            theta1, theta2 = angles
+            pwm1.duty_u16(angle_to_duty(theta1 + OFFSET1))
+            pwm2.duty_u16(angle_to_duty(theta2 + OFFSET2))
+            time.sleep(SETTLE)
+            return
 
-        servo1_angle = theta1 + offset1
-        servo2_angle = theta2 + offset2
 
-        # Convert to pulse widths in milliseconds
-        pulse1 = 0.5 + servo1_angle / 180 * 2.0
-        pulse2 = 0.5 + servo2_angle / 180 * 2.0
+def star(led):
+    """Trace the whole path once with the given LED lit."""
+    for x, y in scaled_points:
+        angles = inverse_kinematics(x, y)
 
-        pulse1 = max(0.5, min(2.5, pulse1))
-        pulse2 = max(0.5, min(2.5, pulse2))
+        if angles is None:
+            print("Unreachable point:", x, y)
+            led.off()  # "lift the pen" over unreachable points
+            continue
 
-        pwm1.duty_u16(int(pulse1 * max_duty / 20))
-        pwm2.duty_u16(int(pulse2 * max_duty / 20))
+        led.on()
+        theta1, theta2 = angles
+        pwm1.duty_u16(angle_to_duty(theta1 + OFFSET1))
+        pwm2.duty_u16(angle_to_duty(theta2 + OFFSET2))
+        time.sleep(STEP_DELAY)
 
-        time.sleep(0.05)
+    led.off()  # pass finished
 
-    else:
-        print("Unreachable point:", x, y)
 
-    i += 1
-
-# One complete sweep finished
-pwm1.deinit()
-pwm2.deinit()
+try:
+    go_to_start()
+    star(led_Y)
+    go_to_start()
+    time.sleep(PAUSE)
+    star(led_G)
+except KeyboardInterrupt:
+    pass
+finally:
+    led_Y.off()
+    led_G.off()
+    go_to_start()  # park at the start point so the next run begins in the same place
+    pwm1.deinit()
+    pwm2.deinit()
