@@ -38,7 +38,8 @@ Don't use Grove 3/4 (they use GPIO 25 = LED) or 6/7 (input-only pins).
 2. `calibrate.py` on the real track, real lighting
 3. `monitor.py`: line right -> error +, line left -> error -; patches light
    the NeoPixels
-4. `main.py`: button A (GPIO34) = start, button B (GPIO35) = stop
+4. 'Receiver': Run on other ESP to display color sensing
+5. `main.py`: button A (GPIO34) = start, button B (GPIO35) = stop
 
 ## Tuning (top of main.py)
 Kept from V1: BASE_SPEED 0.1, KP 0.8, KD 0.1. With better sensor contrast
