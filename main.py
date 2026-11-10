@@ -1,209 +1,278 @@
-# main.py  (V3)
-# PID line follower with RED / GREEN / BLUE patch maneuvers.
-# LEFT + RIGHT sensors straddle the tape and are used ONLY for steering.
-# The MIDDLE sensor sits over the tape and is used ONLY for color.
-# Runs automatically on boot. Press button A (GPIO34) to start,
-# button B (GPIO35) to stop.  Needs calib.json (run calibrate.py first).
+# MAIN.PY - Cytron Robo ESP32 BLE Motor Listener
 
+from BLE_CEEO import Listen
 import time
-from robot_hw import Robot
-import sensing
+import json
+from machine import Pin, PWM, I2C, Timer
+import neopixel
+import vemlsensor
 
-# ================= TUNING =================
-BASE_SPEED = 0.1        # 0..1 forward speed on straights (start slow)
-KP = 0.8                 # steering per unit error
-KI = 0.0                 # leave at 0 unless it sits off-center on long curves
-KD = 0.1                # damps wobble (too high = jittery spinning in place)
-I_LIMIT = 0.5            # anti-windup clamp on the integral
+# -------------------------
+# BUTTON SETUP
+# -------------------------
+button_A = Pin(34, Pin.IN)  # Start
+button_B = Pin(35, Pin.IN)  # Stop
 
-LOST_THRESHOLD = 0.85    # both sensors brighter than this = line lost
-SEARCH_FAST = 0.55       # outer wheel while searching for a lost line
-SEARCH_SLOW = -0.25      # inner wheel while searching (negative = reverse)
-LOST_TIMEOUT_MS = 3000   # give up and stop after this long without the line
+# -------------------------
+# MOTOR SETUP (Robo ESP32: two-input driver)
+# -------------------------
+M1A = PWM(Pin(12), freq=1000, duty_u16=0)
+M1B = PWM(Pin(13), freq=1000, duty_u16=0)
+M2A = PWM(Pin(14), freq=1000, duty_u16=0)
+M2B = PWM(Pin(27), freq=1000, duty_u16=0)
 
-COLOR_MAX_DIST = 0.15    # reject color matches farther than this from calibration
-COLOR_CONFIRM = 2        # consecutive reads that must agree before acting
-COLOR_COOLDOWN_MS = 5000 # ignore colors this long after a maneuver
+def set_motor(pa, pb, speed):
+    d = int(abs(speed) * 65535 / 100)
+    if speed > 0:
+        pa.duty_u16(d); pb.duty_u16(0)
+    elif speed < 0:
+        pa.duty_u16(0); pb.duty_u16(d)
+    else:
+        pa.duty_u16(0); pb.duty_u16(0)
 
-SPIN_SPEED = 0.6         # RED maneuver spin speed
-SPIN_360_MS = 1600       # approx. time for one full turn at SPIN_SPEED (tune!)
-# ==========================================
+def drive(left, right):
+    left = max(-100, min(100, int(left)))
+    right = max(-100, min(100, int(right)))
+    set_motor(M1A, M1B, left)
+    set_motor(M2A, M2B, right)
 
-LED = {"RED": (255, 0, 0), "GREEN": (0, 255, 0), "BLUE": (0, 0, 255)}
+def stop():
+    drive(0, 0)
 
-
-# ---------------- station hook (ESP-NOW goes here later) ----------------
-def notify_station(color):
-    print("COLOR DETECTED:", color)
-    # TODO: send `color` to the station ESP32 with ESP-NOW and wait for ACK
-
-
-# ---------------- maneuvers ----------------
-def maneuver_red(robot, cal):
-    """Spin 360 degrees in place, then stop when the sensors find the line/patch."""
-    robot.leds(*LED["RED"])
-    robot.tone(880, 120)
-    robot.drive(SPIN_SPEED, -SPIN_SPEED)
-    t0 = time.ticks_ms()
-    time.sleep_ms(int(SPIN_360_MS * 1))      # most of the turn blind
-    # finish the turn: stop when a sensor sees dark tape or the red patch again
-    while time.ticks_diff(time.ticks_ms(), t0) < int(SPIN_360_MS * 1.5):
-        l, r = robot.read_sensors()
-        dark = (sensing.brightness(l, cal["left"]) < 0.5 or
-                sensing.brightness(r, cal["right"]) < 0.5)
-        red = sensing.classify(sensing.chroma(robot.read_color(), cal),
-                               cal, COLOR_MAX_DIST) == "RED"
-        if dark or red:
-            break
-        time.sleep_ms(robot.sample_ms)
-    robot.stop()
-    robot.leds(0, 0, 0)
+stop()
 
 
-def maneuver_green(robot, cal):
-    """Stop and play the 'Charge!' bugle call with green lights."""
-    robot.leds(*LED["GREEN"])
-    for f, ms in ((392, 150), (523, 150), (659, 150), (784, 300),
-                  (659, 150), (784, 600)):
-        robot.tone(f, ms, 30)
-    robot.leds(0, 0, 0)
+# -------------------------
+# KNN color detection
+# -------------------------
 
 
-def maneuver_blue(robot, cal):
-    """Stop and flash the two NeoPixels blue, alternating, with chirps."""
-    for i in range(8):
-        robot.leds(*LED["BLUE"], which=i % 2)
-        robot.tone(1500 if i % 2 else 1800, 90, 60)
-    robot.leds(0, 0, 0)
+TARGET = "red"         # the only label we care about
+CSV_FILE = "red_samples.csv"
+RETRAIN = False        # True = ignore the CSV and retrain from scratch
+K_NEIGHBORS = 5
+CONFIRM = 2            # consecutive "red" KNN results before LEDs turn on
+LED_BRIGHT = 60
+LED_HOLD_MS = 600      # keep LEDs lit this long after red was last seen
+COLOR_MS = 50          # how often to run the KNN check
+DEBUG = False          # True = print every raw KNN label (useful for tuning)
+
+# --- training ---
+SAMPLES_PER_SPOT = 20  # readings taken each time you press Enter
+SAMPLE_GAP_MS = 50     # >= sensor integration time so readings aren't duplicates
+# ----------------------------------------
+
+RED = (LED_BRIGHT, 0, 0)
+WHITE = (LED_BRIGHT // 3, LED_BRIGHT // 3, LED_BRIGHT // 3)
+OFF = (0, 0, 0)
+
+# ---------------- hardware ----------------
+col_i2c = I2C(1, sda=Pin(33), scl=Pin(32), freq=400000)
+color_sensor = vemlsensor.VEML6040(col_i2c)
+np = neopixel.NeoPixel(Pin(15), 2)
 
 
-MANEUVERS = {"RED": maneuver_red, "GREEN": maneuver_green, "BLUE": maneuver_blue}
+def set_leds(rgb):
+    np[0] = rgb
+    np[1] = rgb
+    np.write()
 
 
-# ---------------- main follow loop ----------------
-def follow(robot, cal):
-    loop_ms = robot.sample_ms + 2       # a bit longer than one sensor reading
-    integral = 0.0
-    prev_err = None                     # None = no previous error yet (no D kick)
-    last_side = 1                       # +1 = line was last to the right
-    lost_since = None
-    streak_color, streak = None, 0
-    cooldown_until = time.ticks_ms()
-    t_prev = time.ticks_ms()
-
-    while True:
-        t0 = time.ticks_ms()
-        if robot.button_b():
-            print("Stopped by button B")
-            return
-
-        raw_l, raw_r = robot.read_sensors()
-
-        # ----- 1. color patches (middle sensor only) -----
-        if time.ticks_diff(t0, cooldown_until) >= 0:
-            col = sensing.classify(sensing.chroma(robot.read_color(), cal),
-                                   cal, COLOR_MAX_DIST)
-            if col is not None and col == streak_color:
-                streak += 1
-            else:
-                streak_color, streak = col, (1 if col else 0)
-
-            if streak >= COLOR_CONFIRM:
-                robot.stop()
-                notify_station(streak_color)
-                MANEUVERS[streak_color](robot, cal)
-                streak_color, streak = None, 0
-                integral, prev_err = 0.0, None
-                cooldown_until = time.ticks_add(time.ticks_ms(), COLOR_COOLDOWN_MS)
-                t_prev = time.ticks_ms()
-                continue
-
-            if streak > 0:
-                # probably on a patch: go straight & slow while confirming,
-                # since colored tape confuses the brightness-based steering
-                robot.drive(BASE_SPEED * 0.7, BASE_SPEED * 0.7)
-                prev_err = None
-                _pace(t0, loop_ms)
-                continue
-
-        # ----- 2. line position (left + right steering sensors only) -----
-        # error > 0 : right sensor darker -> line is to the right
-        error, L, R = sensing.line_error(raw_l, raw_r, cal)
-
-        if L > LOST_THRESHOLD and R > LOST_THRESHOLD:
-            # Both white: line slipped outside both sensors. Turn hard toward
-            # the side it was last seen on.
-            if lost_since is None:
-                lost_since = t0
-            elif time.ticks_diff(t0, lost_since) > LOST_TIMEOUT_MS:
-                robot.stop()
-                print("Line lost - stopping")
-                for _ in range(3):
-                    robot.tone(300, 200, 100)
-                return
-            if last_side > 0:
-                robot.drive(SEARCH_FAST, SEARCH_SLOW)
-            else:
-                robot.drive(SEARCH_SLOW, SEARCH_FAST)
-            integral = 0.0
-            prev_err = float(last_side)
-            t_prev = t0
-            _pace(t0, loop_ms)
-            continue
-        lost_since = None
-
-        if abs(error) > 0.1:
-            last_side = 1 if error > 0 else -1
-
-        # ----- 3. PID -----
-        # dt never smaller than one loop, so the first step after a start /
-        # maneuver doesn't make a huge derivative spike
-        dt = max(time.ticks_diff(t0, t_prev), loop_ms) / 1000
-        t_prev = t0
-        integral = max(-I_LIMIT, min(I_LIMIT, integral + error * dt))
-        deriv = 0.0 if prev_err is None else (error - prev_err) / dt
-        prev_err = error
-
-        correction = KP * error + KI * integral + KD * deriv
-        robot.drive(BASE_SPEED + correction, BASE_SPEED - correction)
-
-        _pace(t0, loop_ms)
+# ---------------- features ----------------
+def features(r, g, b):
+    """Chromaticity: each channel's share of the total.
+    Ignores overall brightness, so lighting/height changes matter less."""
+    s = r + g + b
+    if s <= 0:
+        return (0.0, 0.0, 0.0)
+    return (r / s, g / s, b / s)
 
 
-def _pace(t0, loop_ms):
-    left = loop_ms - time.ticks_diff(time.ticks_ms(), t0)
-    if left > 0:
-        time.sleep_ms(left)
-
-
-# ---------------- startup ----------------
-def run():
-    robot = Robot()
+# ---------------- CSV ----------------
+def load_csv():
+    """Return list of (r, g, b, label). Empty list if file missing or blank."""
+    rows = []
     try:
-        cal = sensing.load()
+        with open(CSV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("r,"):   # skip blanks + header
+                    continue
+                parts = line.split(",")
+                if len(parts) != 4:
+                    continue
+                try:
+                    r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+                except ValueError:
+                    continue
+                rows.append((r, g, b, parts[3]))
     except OSError:
-        print("No calib.json found - run calibrate.py first.")
-        for _ in range(5):
-            robot.leds(255, 0, 0)
-            time.sleep_ms(200)
-            robot.leds(0, 0, 0)
-            time.sleep_ms(200)
+        pass  # file doesn't exist yet
+    return rows
+
+
+def save_csv(rows):
+    with open(CSV_FILE, "w") as f:
+        f.write("r,g,b,label\n")
+        for r, g, b, label in rows:
+            f.write("%d,%d,%d,%s\n" % (r, g, b, label))
+    print("Saved %d samples to %s" % (len(rows), CSV_FILE))
+
+
+# ---------------- training ----------------
+def collect(label, rows):
+    for _ in range(SAMPLES_PER_SPOT):
+        r, g, b, w = color_sensor.read_rgbw()
+        rows.append((r, g, b, label))
+        time.sleep_ms(SAMPLE_GAP_MS)
+
+
+def train_group(label, instructions, rows, led):
+    print()
+    print(instructions)
+    spots = 0
+    while True:
+        cmd = input("  Spot %d: place sensor, press Enter (d = done): " % (spots + 1))
+        if cmd.strip().lower() == "d":
+            if spots == 0:
+                print("  Need at least one spot first.")
+                continue
+            break
+        set_leds(led)          # LEDs on = currently sampling, hold still
+        collect(label, rows)
+        set_leds(OFF)
+        spots += 1
+        print("  got %d samples" % SAMPLES_PER_SPOT)
+
+
+def train():
+    print("=== Training red detector ===")
+    rows = []
+    train_group(TARGET,
+                "RED: put the sensor over red patches. Vary position/angle a bit.",
+                rows, RED)
+    train_group("other",
+                "NOT RED: white floor, black tape, green, blue, edges of the tape...\n"
+                "  anything the robot might see that should NOT count as red.",
+                rows, WHITE)
+    save_csv(rows)
+    return rows
+
+
+# ---------------- KNN ----------------
+def build_model(rows):
+    return [(features(r, g, b), label) for r, g, b, label in rows]
+
+
+def classify(model, f, k):
+    """Majority vote of the k nearest samples: red needs more than half."""
+    dists = []
+    for (fr, fg, fb), label in model:
+        d = (fr - f[0]) ** 2 + (fg - f[1]) ** 2 + (fb - f[2]) ** 2
+        dists.append((d, label))
+    dists.sort(key=lambda x: x[0])
+    nearest = dists[:k]
+    red_votes = sum(1 for _, label in nearest if label == TARGET)
+    return TARGET if red_votes * 2 > len(nearest) else "other"
+
+
+def read_label(model):
+    r, g, b, w = color_sensor.read_rgbw()
+    return classify(model, features(r, g, b), K_NEIGHBORS)
+
+rows = load_csv()      # always read the pre-populated CSV, never train
+if rows:
+    print("Loaded %d samples from %s" % (len(rows), CSV_FILE))
+else:
+    print("ERROR: no samples in %s -- red will never be detected" % CSV_FILE)
+
+model = build_model(rows)
+n_red = sum(1 for row in rows if row[3] == TARGET)
+print("Model: %d red, %d other" % (n_red, len(rows) - n_red))
+if n_red == 0 or n_red == len(rows):
+    print("WARNING: need both red and not-red samples; set RETRAIN = True")
+red_count = 0          # consecutive red readings
+last_red_seen = 0      # ticks_ms when red was last confirmed
+lit = False
+
+
+def check_red(t):
+    """Runs every COLOR_MS on a timer, so it keeps going while BLE waits/runs."""
+    global red_count, last_red_seen, lit
+    now_ms = time.ticks_ms()
+    label = read_label(model)
+    if DEBUG:
+        print(label)
+    if label == TARGET:
+        red_count += 1
+    else:
+        red_count = 0
+
+    if red_count >= CONFIRM:
+        last_red_seen = now_ms
+        if not lit:
+            lit = True
+            set_leds(RED)
+            print("Detected red")
+
+    #turn the LEDs off once we've been off red for a moment
+    if lit and time.ticks_diff(now_ms, last_red_seen) > LED_HOLD_MS:
+        lit = False
+        set_leds(OFF)
+        print("Red cleared")
+
+
+color_timer = Timer(0)
+
+
+# -------------------------
+# BLE SETUP
+# -------------------------
+NAME = "A"
+buffer = b""
+connected = False
+
+def callback(data):
+    global buffer
+    if not connected:
         return
+    buffer += data
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        try:
+            message = json.loads(line.decode())
+            print("Received:", message)
+            if "left" in message and "right" in message:
+                drive(message["left"], message["right"])
+                print("Left:", message["left"], "Right:", message["right"])
+        except Exception as e:
+            print("Message error:", e)
 
-    try:
-        while True:
-            robot.stop()
-            robot.leds(30, 30, 30)       # dim white = ready
-            print("Ready. Press button A to start.")
-            robot.wait_button_a()
-            robot.leds(0, 0, 0)
-            robot.tone(1000 + 50, 100)   # (avoid exactly 1000 Hz = motor PWM freq)
-            time.sleep_ms(400)
-            robot.tone(1568, 150)
-            follow(robot, cal)
-    finally:
-        robot.stop()                     # always stop motors on error / Ctrl-C
-        robot.leds(0, 0, 0)
+p = None
+print("Robot ready! Motors OFF")
+
+try:
+    p = Listen(NAME, verbose=False)
+    p.callback = callback
+
+    print("Looking for", NAME, "...")
+    if p.connect_up():
+        connected = True
+        print("Connected")
+        count = 0
+        while p.is_connected:
+            color_timer.init(period=COLOR_MS, mode=Timer.PERIODIC, callback=check_red)
+            payload = json.dumps({"from": "listener", "lit": lit}) + "\n"
+            for start in range(0, len(payload), 20):
+                p.send(payload[start:start + 20])
+                time.sleep_ms(50)
+            time.sleep(0.3)
+    print("Lost connection")
+finally:
+    color_timer.deinit()
+    set_leds(OFF)
+    if p:
+        stop()
+        p.disconnect()
 
 
-run()
